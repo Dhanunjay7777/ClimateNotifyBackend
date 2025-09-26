@@ -7,6 +7,7 @@ const { Client, Databases, ID, Query } = require('node-appwrite');
 const admin = require('firebase-admin');
 const bcrypt = require('bcrypt');
 const { v4: uuidv4 } = require('uuid');
+const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
@@ -219,6 +220,116 @@ async function notifySpecificUsers(userIds, title, body, data = {}) {
   } catch (error) {
 
     return { success: 0, failure: 0, errors: [error.message] };
+  }
+}
+
+// ===== RENDER API HELPER FUNCTIONS =====
+
+/**
+ * Check if user has admin access level
+ */
+async function verifyAdminAccess(authHeader) {
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    throw new Error('Authentication required. Admin access only.');
+  }
+
+  // Extract user ID from Bearer token
+  const userId = authHeader.replace('Bearer ', '');
+  
+  if (!userId || userId === 'admin-token') {
+    throw new Error('Invalid authentication token. Please login again.');
+  }
+
+  try {
+    // Get user from database to check accessLevel
+    let user = null;
+    
+    try {
+      // Try SDK first
+      const userDoc = await databases.getDocument(
+        process.env.APPWRITE_DATABASE_ID,
+        process.env.CONSUMERS_COLLECTION_ID || 'consumers',
+        userId
+      );
+      user = userDoc;
+    } catch (sdkError) {
+      // Fallback to direct API if SDK fails
+      const databaseId = process.env.APPWRITE_DATABASE_ID;
+      const collectionId = process.env.CONSUMERS_COLLECTION_ID || 'consumers';
+      const projectId = process.env.APPWRITE_PROJECT_ID;
+      const apiKey = process.env.APPWRITE_API_KEY;
+      const endpoint = process.env.APPWRITE_ENDPOINT;
+
+      const response = await fetch(
+        `${endpoint}/databases/${databaseId}/collections/${collectionId}/documents/${userId}`,
+        {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Appwrite-Project': projectId,
+            'X-Appwrite-Key': apiKey
+          }
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error('User not found or unauthorized access');
+      }
+
+      user = await response.json();
+    }
+
+    // Check if user has admin access
+    if (!user || user.accessLevel !== 'admin') {
+      throw new Error('Unauthorized access. Admin privileges required.');
+    }
+
+    // Check if user is approved
+    if (user.approvedStatus !== 'true' && user.approvedStatus !== true) {
+      throw new Error('Account not approved. Contact administrator.');
+    }
+
+    return true;
+  } catch (error) {
+    throw new Error(error.message || 'Authentication failed. Admin access required.');
+  }
+}
+
+/**
+ * Make authenticated request to Render API
+ */
+async function makeRenderAPIRequest(method, endpoint, data = null) {
+  const renderApiKey = process.env.RENDER_API_KEY;
+  
+  if (!renderApiKey) {
+    throw new Error('RENDER_API_KEY environment variable is required');
+  }
+
+  const config = {
+    method: method,
+    url: `https://api.render.com/v1${endpoint}`,
+    headers: {
+      'Accept': 'application/json',
+      'Authorization': `Bearer ${renderApiKey}`
+    },
+    timeout: 30000
+  };
+
+  if (data && (method === 'POST' || method === 'PATCH' || method === 'PUT')) {
+    config.data = data;
+    config.headers['Content-Type'] = 'application/json';
+  }
+
+  try {
+    const response = await axios(config);
+    return response.data;
+  } catch (error) {
+    console.error('Render API Error:', {
+      status: error.response?.status,
+      message: error.response?.data?.message || error.message,
+      endpoint: endpoint
+    });
+    throw new Error(`Render API Error: ${error.response?.data?.message || error.message}`);
   }
 }
 
@@ -1406,6 +1517,189 @@ app.get('/api/tokens', async (req, res) => {
         database: process.env.APPWRITE_DATABASE_ID,
         collection: process.env.TOKENS_COLLECTION_ID
       }
+    });
+  }
+});
+
+// ===== RENDER API ENDPOINTS (ADMIN ONLY) =====
+
+// Get all Render services
+app.get('/api/admin/render/services', async (req, res) => {
+  try {
+    // Verify admin access
+    await verifyAdminAccess(req.headers.authorization);
+
+    const limit = req.query.limit || 20;
+    const renderData = await makeRenderAPIRequest('GET', `/services?limit=${limit}`);
+    
+    // Extract services from the Render API response format
+    const services = renderData.map(item => ({
+      id: item.service.id,
+      name: item.service.name,
+      type: item.service.type,
+      status: item.service.suspended === 'not_suspended' ? 'running' : 'suspended',
+      url: item.service.serviceDetails?.url || null,
+      env: item.service.serviceDetails?.env || 'unknown',
+      updatedAt: item.service.updatedAt,
+      dashboardUrl: item.service.dashboardUrl
+    }));
+
+    res.json({
+      status: 'success',
+      message: `Retrieved ${services.length} services`,
+      services: services
+    });
+
+  } catch (error) {
+    console.error('Get services error:', error);
+    res.status(error.message.includes('Authentication') ? 401 : 500).json({
+      status: 'error',
+      message: error.message || 'Failed to retrieve services'
+    });
+  }
+});
+
+// Get specific service details
+app.get('/api/admin/render/services/:serviceId', async (req, res) => {
+  try {
+    // Verify admin access
+    await verifyAdminAccess(req.headers.authorization);
+
+    const { serviceId } = req.params;
+    const service = await makeRenderAPIRequest('GET', `/services/${serviceId}`);
+
+    res.json({
+      status: 'success',
+      message: 'Service details retrieved successfully',
+      data: service
+    });
+
+  } catch (error) {
+    console.error('Get service error:', error);
+    res.status(error.message.includes('Authentication') ? 401 : 500).json({
+      status: 'error',
+      message: error.message || 'Failed to retrieve service details'
+    });
+  }
+});
+
+// Deploy a service
+app.post('/api/admin/render/services/:serviceId/deploy', async (req, res) => {
+  try {
+    // Verify admin access
+    await verifyAdminAccess(req.headers.authorization);
+
+    const { serviceId } = req.params;
+    const deployment = await makeRenderAPIRequest('POST', `/services/${serviceId}/deploys`);
+
+    res.json({
+      status: 'success',
+      message: 'Service deployment initiated successfully',
+      data: deployment
+    });
+
+  } catch (error) {
+    console.error('Deploy service error:', error);
+    res.status(error.message.includes('Authentication') ? 401 : 500).json({
+      status: 'error',
+      message: error.message || 'Failed to deploy service'
+    });
+  }
+});
+
+// Suspend a service
+app.post('/api/admin/render/services/:serviceId/suspend', async (req, res) => {
+  try {
+    // Verify admin access
+    await verifyAdminAccess(req.headers.authorization);
+
+    const { serviceId } = req.params;
+    const result = await makeRenderAPIRequest('POST', `/services/${serviceId}/suspend`);
+
+    res.json({
+      status: 'success',
+      message: 'Service suspended successfully',
+      data: result
+    });
+
+  } catch (error) {
+    console.error('Suspend service error:', error);
+    res.status(error.message.includes('Authentication') ? 401 : 500).json({
+      status: 'error',
+      message: error.message || 'Failed to suspend service'
+    });
+  }
+});
+
+// Resume a service
+app.post('/api/admin/render/services/:serviceId/resume', async (req, res) => {
+  try {
+    // Verify admin access
+    await verifyAdminAccess(req.headers.authorization);
+
+    const { serviceId } = req.params;
+    const result = await makeRenderAPIRequest('POST', `/services/${serviceId}/resume`);
+
+    res.json({
+      status: 'success',
+      message: 'Service resumed successfully',
+      data: result
+    });
+
+  } catch (error) {
+    console.error('Resume service error:', error);
+    res.status(error.message.includes('Authentication') ? 401 : 500).json({
+      status: 'error',
+      message: error.message || 'Failed to resume service'
+    });
+  }
+});
+
+// Restart a service
+app.post('/api/admin/render/services/:serviceId/restart', async (req, res) => {
+  try {
+    // Verify admin access
+    await verifyAdminAccess(req.headers.authorization);
+
+    const { serviceId } = req.params;
+    const result = await makeRenderAPIRequest('POST', `/services/${serviceId}/restart`);
+
+    res.json({
+      status: 'success',
+      message: 'Service restarted successfully',
+      data: result
+    });
+
+  } catch (error) {
+    console.error('Restart service error:', error);
+    res.status(error.message.includes('Authentication') ? 401 : 500).json({
+      status: 'error',
+      message: error.message || 'Failed to restart service'
+    });
+  }
+});
+
+// Get service deployments
+app.get('/api/admin/render/services/:serviceId/deployments', async (req, res) => {
+  try {
+    // Verify admin access
+    await verifyAdminAccess(req.headers.authorization);
+
+    const { serviceId } = req.params;
+    const limit = req.query.limit || 10;
+    const deployments = await makeRenderAPIRequest('GET', `/services/${serviceId}/deploys?limit=${limit}`);
+
+    res.json({
+      status: 'success',
+      message: 'Service deployments retrieved successfully',
+      data: deployments
+    });
+
+  } catch (error) {
+    console.error('Get deployments error:', error);
+    res.status(error.message.includes('Authentication') ? 401 : 500).json({
+      status: 'error',
+      message: error.message || 'Failed to retrieve service deployments'
     });
   }
 });
