@@ -1533,20 +1533,7 @@ app.post('/api/notifications/broadcast', async (req, res) => {
 app.use('*', (req, res) => {
   res.status(404).json({
     status: 'error',
-    message: 'Endpoint not found',
-    availableEndpoints: [
-      'GET /health - Server health check',
-      'POST /api/signup - Create user account',
-      'POST /api/admin/create-user - Admin create user with custom role/status',
-      'POST /api/login - User authentication',
-      'GET /api/consumers - Get all consumers (admin)',
-      'PUT /api/consumers/:id - Update consumer status/role (admin)',
-      'POST /api/messages - Create message and send notifications',
-      'GET /api/messages - Get all messages',
-      'POST /api/tokens - Save/update FCM token',
-      'GET /api/tokens - Get all active tokens',
-      'GET /api/users-with-tokens - Get users for selection interface'
-    ]
+    message: 'Endpoint not found'
   });
 });
 
