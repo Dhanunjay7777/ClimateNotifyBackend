@@ -18,6 +18,9 @@
   "author": "ClimateNotify Team",
   "license": "MIT",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.896.0",
+    "@aws-sdk/s3-request-presigner": "^3.896.0",
+    "aws-sdk": "^2.1692.0",
     "axios": "^1.7.2",
     "bcrypt": "^6.0.0",
     "compression": "^1.7.4",
@@ -27,6 +30,7 @@
     "express-rate-limit": "^6.8.1",
     "firebase-admin": "^13.5.0",
     "helmet": "^7.0.0",
+    "mongodb": "^6.20.0",
     "node-appwrite": "^11.1.1",
     "uuid": "^13.0.0"
   },

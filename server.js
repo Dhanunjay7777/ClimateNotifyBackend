@@ -1704,6 +1704,12 @@ app.get('/api/admin/render/services/:serviceId/deployments', async (req, res) =>
   }
 });
 
+// ===== REPORTS API ROUTES =====
+
+// Include the reports API routes
+const reportsRoutes = require('./api/reports');
+app.use('/api/reports', reportsRoutes);
+
 // ===== NOTIFICATION ENDPOINTS =====
 
 // Send notification to specific users
