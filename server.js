@@ -1,3 +1,33 @@
+const sdk = require('node-appwrite');
+const fs = require('fs');
+const { InputFile } = require('node-appwrite');
+
+async function uploadFileToAppwriteStorage(fileBuffer, filename) {
+  const client = new sdk.Client()
+    .setEndpoint(process.env.APPWRITE_ENDPOINT)
+    .setProject(process.env.APPWRITE_PROJECT_ID)
+    .setKey(process.env.APPWRITE_API_KEY);
+
+  const storage = new sdk.Storage(client);
+  const bucketId = process.env.APPWRITE_BUCKET_ID; // Bucket ID from environment variables
+
+  try {
+    // Create InputFile from buffer
+    const inputFile = InputFile.fromBuffer(fileBuffer, filename);
+
+    const response = await storage.createFile(bucketId, sdk.ID.unique(), inputFile);
+    const fileId = response.$id;
+
+    // Construct the file URL (view URL)
+    const fileUrl = `${process.env.APPWRITE_ENDPOINT}/storage/buckets/${bucketId}/files/${fileId}/view?project=${process.env.APPWRITE_PROJECT_ID}`;
+    return { fileId, fileUrl };
+  } catch (error) {
+    console.error('❌ Appwrite upload error:', error);
+    throw error;
+  }
+}
+
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -204,9 +234,6 @@ async function notifyAllUsers(title, body, data = {}) {
   }
 }
 
-/**
- * Send notification to specific users by userIds
- */
 async function notifySpecificUsers(userIds, title, body, data = {}) {
   try {
     const tokens = await getTokensByUserIds(userIds);
@@ -241,47 +268,16 @@ async function verifyAdminAccess(authHeader) {
   }
 
   try {
-    // Get user from database to check accessLevel
-    let user = null;
-    
-    try {
-      // Try SDK first
-      const userDoc = await databases.getDocument(
-        process.env.APPWRITE_DATABASE_ID,
-        process.env.CONSUMERS_COLLECTION_ID || 'consumers',
-        userId
-      );
-      user = userDoc;
-    } catch (sdkError) {
-      // Fallback to direct API if SDK fails
-      const databaseId = process.env.APPWRITE_DATABASE_ID;
-      const collectionId = process.env.CONSUMERS_COLLECTION_ID || 'consumers';
-      const projectId = process.env.APPWRITE_PROJECT_ID;
-      const apiKey = process.env.APPWRITE_API_KEY;
-      const endpoint = process.env.APPWRITE_ENDPOINT;
-
-      const response = await fetch(
-        `${endpoint}/databases/${databaseId}/collections/${collectionId}/documents/${userId}`,
-        {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Appwrite-Project': projectId,
-            'X-Appwrite-Key': apiKey
-          }
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error('User not found or unauthorized access');
-      }
-
-      user = await response.json();
-    }
+    // Get user from database to check accessLevel using consumerID
+    const user = await findUserByConsumerID(userId);
 
     // Check if user has admin access
-    if (!user || user.accessLevel !== 'admin') {
-      throw new Error('Unauthorized access. Admin privileges required.');
+    if (!user) {
+      throw new Error(`User with consumerID '${userId}' not found in database. Please ensure you are logged in and your account exists.`);
+    }
+    
+    if (user.accessLevel !== 'admin') {
+      throw new Error(`Access denied. Current access level: '${user.accessLevel}', required: 'admin'. Contact administrator to update your access level in the consumers collection.`);
     }
 
     // Check if user is approved
@@ -373,6 +369,44 @@ async function checkConsumerIdExists(consumerID) {
   }
 }
 
+// Find user by consumerID using direct API (SDK has issues with Query)
+async function findUserByConsumerID(consumerID) {
+  try {
+    // Use direct API call to avoid SDK Query issues
+    const databaseId = process.env.APPWRITE_DATABASE_ID;
+    const collectionId = process.env.CONSUMERS_COLLECTION_ID || 'consumers';
+    const projectId = process.env.APPWRITE_PROJECT_ID;
+    const apiKey = process.env.APPWRITE_API_KEY;
+    const endpoint = process.env.APPWRITE_ENDPOINT;
+
+    const fullUrl = `${endpoint}/databases/${databaseId}/collections/${collectionId}/documents`;
+
+    const response = await fetch(fullUrl, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Appwrite-Project': projectId,
+        'X-Appwrite-Key': apiKey
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    
+    // Find user with matching consumerID
+    if (data.documents && data.documents.length > 0) {
+      const user = data.documents.find(doc => doc.consumerID === consumerID);
+      return user || null;
+    }
+    return null;
+  } catch (error) {
+    return null;
+  }
+}
+
 // Generate a unique consumerID with collision checking
 async function generateUniqueConsumerID() {
   let consumerID = uuidv4();
@@ -419,97 +453,6 @@ const limiter = rateLimit({
   }
 });
 app.use('/api/', limiter);
-
-// Test endpoint for debugging
-app.get('/api/test', (req, res) => {
-  res.json({
-    status: 'success',
-    message: 'API is working',
-    environment: {
-      NODE_ENV: process.env.NODE_ENV,
-      DATABASE_ID: process.env.APPWRITE_DATABASE_ID,
-      MESSAGES_COLLECTION_ID: process.env.MESSAGES_COLLECTION_ID,
-      TOKENS_COLLECTION_ID: process.env.TOKENS_COLLECTION_ID
-    },
-    timestamp: new Date().toISOString()
-  });
-});
-
-// Minimal database test
-app.get('/api/test-db', async (req, res) => {
-  try {
-
-    
-    // Test the most basic database operation - just getting database info
-    const dbList = await databases.list();
-
-    
-    res.json({
-      status: 'success',
-      message: 'Database connection successful',
-      databaseCount: dbList.total
-    });
-  } catch (error) {
-
-    res.status(500).json({
-      status: 'error',
-      message: 'Database connection failed',
-      error: error.message
-    });
-  }
-});
-
-// Simple collection test endpoint
-app.get('/api/test-collection', async (req, res) => {
-  try {
-
-
-
-    
-    // First try to list all collections to see what's available
-
-    try {
-      const collections = await databases.list();
-
-    } catch (listError) {
-
-    }
-    
-    // Try the simplest possible query
-    const response = await databases.listDocuments(
-      process.env.APPWRITE_DATABASE_ID,
-      process.env.MESSAGES_COLLECTION_ID,
-      []
-    );
-    
-
-    
-    res.json({
-      status: 'success',
-      message: 'Collection access successful',
-      totalDocuments: response.total,
-      documentsReturned: response.documents.length,
-      firstDocument: response.documents[0] ? {
-        $id: response.documents[0].$id,
-        message: response.documents[0].message,
-        $createdAt: response.documents[0].$createdAt
-      } : null
-    });
-  } catch (error) {
-
-    res.status(500).json({
-      status: 'error',
-      message: 'Collection access failed',
-      error: error.message,
-      code: error.code,
-      type: error.type,
-      debug: {
-        database: process.env.APPWRITE_DATABASE_ID,
-        collection: process.env.MESSAGES_COLLECTION_ID
-      }
-    });
-  }
-});
 
 // Health check endpoint
 app.get('/health', async (req, res) => {
@@ -1704,7 +1647,642 @@ app.get('/api/admin/render/services/:serviceId/deployments', async (req, res) =>
   }
 });
 
-// ===== REPORTS API ROUTES =====
+// ===== CLIMATE REPORTS API ENDPOINTS =====
+
+// Save climate report to database (Admin only)
+app.post('/api/climate-reports', async (req, res) => {
+  try {
+    const { reportData, consumerId, fileData } = req.body;
+
+    if (!reportData || !consumerId) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'reportData and consumerId are required'
+      });
+    }
+
+    // Verify admin access by checking Consumers collection directly
+    try {
+      const user = await findUserByConsumerID(consumerId);
+
+      if (!user) {
+        return res.status(404).json({
+          status: 'error',
+          message: 'User not found'
+        });
+      }
+
+      if (user.accessLevel !== 'admin') {
+        return res.status(403).json({
+          status: 'error',
+          message: 'Access denied. Only admin users can generate climate reports.'
+        });
+      }
+
+    } catch (adminError) {
+      return res.status(500).json({
+        status: 'error',
+        message: 'Error verifying admin access: ' + adminError.message
+      });
+    }
+
+    // Handle file upload to Appwrite Storage
+    let fileUrl = '';
+    let fileSize = '0 KB';
+
+    if (fileData) {
+      try {
+        // If fileData is base64, convert to buffer
+        let fileBuffer;
+        let filename = `climate_report_${Date.now()}.pdf`;
+
+        if (fileData.startsWith('data:')) {
+          // Handle base64 data URL
+          const base64Data = fileData.split(',')[1];
+          fileBuffer = Buffer.from(base64Data, 'base64');
+          // Extract filename from data URL if available
+          const mimeMatch = fileData.match(/data:([^;]+)/);
+          if (mimeMatch && mimeMatch[1] === 'application/pdf') {
+            filename = `climate_report_${Date.now()}.pdf`;
+          }
+        } else {
+          // Assume it's already a buffer or handle as needed
+          fileBuffer = Buffer.from(fileData, 'base64');
+        }
+
+        // Upload to Appwrite Storage using buffer directly
+        const uploadResult = await uploadFileToAppwriteStorage(fileBuffer, filename);
+        fileUrl = uploadResult.fileUrl;
+
+        // Calculate file size from buffer
+        const sizeInMB = (fileBuffer.length / (1024 * 1024)).toFixed(2);
+        fileSize = `${sizeInMB} MB`;
+
+      } catch (uploadError) {
+        console.error('❌ File upload failed:', uploadError);
+        return res.status(500).json({
+          status: 'error',
+          message: 'Failed to upload file to storage',
+          error: uploadError.message
+        });
+      }
+    } else {
+      // Use provided fileUrl if no file data
+      fileUrl = reportData.fileUrl || '';
+      fileSize = reportData.fileSize || '0 KB';
+    }
+
+    // Generate unique ReportId
+    const reportId = `RPT_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    // Create simplified climate report document
+    const reportDocument = {
+      reportId: String(reportId),
+      consumerId: String(consumerId),
+      title: String(reportData.title || ''),
+      type: String(reportData.type || ''),
+      period: String(reportData.period || ''),
+      region: String(reportData.region || ''),
+      generatedDate: String(reportData.generatedDate || new Date().toISOString()),
+      fileSize: String(fileSize),
+      status: String(reportData.status || 'completed'),
+      downloadCount: parseInt(reportData.downloadCount) || 0, // Integer for Appwrite
+      fileUrl: String(fileUrl),
+      isPublic: Boolean(reportData.isPublic || false)
+    };
+
+    const collectionId = process.env.CLIMATE_REPORTS_COLLECTION_ID || 'climate_reports';
+    
+    const savedReport = await databases.createDocument(
+      process.env.APPWRITE_DATABASE_ID,
+      collectionId,
+      ID.unique(),
+      reportDocument
+    );
+
+    res.status(201).json({
+      status: 'success',
+      message: 'Climate report saved successfully',
+      data: {
+        id: savedReport.$id,
+        reportId: savedReport.reportId,
+        title: savedReport.title,
+        fileUrl: savedReport.fileUrl,
+        createdAt: savedReport.$createdAt,
+        consumerId: savedReport.consumerId
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Save climate report error:', {
+      message: error.message,
+      type: error.type,
+      code: error.code,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+    
+    // Check if it's a collection not found error
+    if (error.code === 404 || error.type === 'collection_not_found') {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Climate reports collection does not exist in Appwrite',
+        error: 'Please create the climate_reports collection in Appwrite console',
+        code: error.code,
+        type: error.type,
+        solution: {
+          step1: 'Go to Appwrite Console → Database → Collections',
+          step2: 'Create new collection with ID: climate_reports',
+          step3: 'Add attributes as per APPWRITE_DATABASE_SCHEMA.md',
+          step4: 'Set proper permissions for read/write access'
+        }
+      });
+    }
+    
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to save climate report',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error',
+      details: process.env.NODE_ENV === 'development' ? {
+        type: error.type,
+        code: error.code,
+        message: error.message
+      } : undefined
+    });
+  }
+});
+
+// Get user by consumerID for access verification
+app.get('/api/user/:consumerID', async (req, res) => {
+  try {
+    const { consumerID } = req.params;
+    
+    if (!consumerID) {
+      return res.status(400).json({ error: 'Consumer ID is required' });
+    }
+    
+    const user = await findUserByConsumerID(consumerID);
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    res.json({
+      consumerID: user.consumerID,
+      accessLevel: user.accessLevel,
+      fullname: user.fullname
+    });
+    
+  } catch (error) {
+    console.error('❌ Error looking up user:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all climate reports (simplified, no sync)
+app.get('/api/climate-reports', async (req, res) => {
+  try {
+    const { limit = 50 } = req.query;
+
+    // Use direct API call to avoid SDK Query issues
+    const databaseId = process.env.APPWRITE_DATABASE_ID;
+    const collectionId = process.env.CLIMATE_REPORTS_COLLECTION_ID || 'climate_reports';
+    const projectId = process.env.APPWRITE_PROJECT_ID;
+    const apiKey = process.env.APPWRITE_API_KEY;
+    const endpoint = process.env.APPWRITE_ENDPOINT;
+
+    const fullUrl = `${endpoint}/databases/${databaseId}/collections/${collectionId}/documents?limit=${limit}&orderType=desc&orderAttributes=$createdAt`;
+
+    const apiResponse = await fetch(fullUrl, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Appwrite-Project': projectId,
+        'X-Appwrite-Key': apiKey
+      }
+    });
+
+    if (!apiResponse.ok) {
+      throw new Error(`HTTP ${apiResponse.status}: ${apiResponse.statusText}`);
+    }
+
+    const response = await apiResponse.json();
+
+    const reports = response.documents.map(report => ({
+      id: report.$id,
+      reportId: report.reportId,
+      title: report.title || 'Untitled Report',
+      type: report.type || 'comprehensive',
+      period: report.period || 'monthly',
+      region: report.region || 'global',
+      consumerId: report.consumerId || '',
+      status: report.status || 'completed',
+      downloadCount: parseInt(report.downloadCount) || 0, // Return as integer for frontend
+      fileSize: report.fileSize || '0 KB',
+      fileUrl: report.fileUrl || '',
+      generatedDate: report.generatedDate || report.$createdAt,
+      isPublic: report.isPublic || false
+    }));
+
+    res.json({
+      status: 'success',
+      data: {
+        reports: reports,
+        total: response.total || 0,
+        timestamp: new Date().toISOString()
+      }
+    });
+
+  } catch (error) {
+    console.error('Get climate reports error:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to fetch climate reports',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+// Get climate reports for a specific consumer
+app.get('/api/climate-reports/consumer/:consumerId', async (req, res) => {
+  try {
+    const { consumerId } = req.params;
+    const { limit = 50 } = req.query;
+
+    if (!consumerId) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'consumerId is required'
+      });
+    }
+
+    // Use direct API call to avoid SDK Query issues
+    const databaseId = process.env.APPWRITE_DATABASE_ID;
+    const collectionId = process.env.CLIMATE_REPORTS_COLLECTION_ID || 'climate_reports';
+    const projectId = process.env.APPWRITE_PROJECT_ID;
+    const apiKey = process.env.APPWRITE_API_KEY;
+    const endpoint = process.env.APPWRITE_ENDPOINT;
+
+    const fullUrl = `${endpoint}/databases/${databaseId}/collections/${collectionId}/documents?limit=${limit}&orderType=desc&orderAttributes=$createdAt`;
+
+    const apiResponse = await fetch(fullUrl, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Appwrite-Project': projectId,
+        'X-Appwrite-Key': apiKey
+      }
+    });
+
+    if (!apiResponse.ok) {
+      throw new Error(`HTTP ${apiResponse.status}: ${apiResponse.statusText}`);
+    }
+
+    const reports = await apiResponse.json();
+    
+    // Filter by consumerId manually since we can't use Query.equal
+    const filteredReports = reports.documents ? 
+      reports.documents.filter(doc => doc.consumerId === consumerId) : [];
+
+    res.json({
+      status: 'success',
+      data: {
+        reports: filteredReports,
+        total: filteredReports.length
+      }
+    });
+
+  } catch (error) {
+    console.error('Get climate reports error:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to fetch climate reports',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+// Update climate report (Admin only)
+app.put('/api/climate-reports/:reportId', async (req, res) => {
+  try {
+    const { reportId } = req.params;
+    const { updateData, consumerId } = req.body;
+
+    if (!reportId || !updateData || !consumerId) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'reportId, updateData, and consumerId are required'
+      });
+    }
+
+    // Verify admin access by checking user directly (not using Bearer token)
+    try {
+      const user = await findUserByConsumerID(consumerId);
+
+      if (!user) {
+        return res.status(404).json({
+          status: 'error',
+          message: `User with consumerID '${consumerId}' not found in database. Please ensure you are logged in and your account exists.`
+        });
+      }
+
+      if (user.accessLevel !== 'admin') {
+        return res.status(403).json({
+          status: 'error',
+          message: `Access denied. Current access level: '${user.accessLevel}', required: 'admin'. Contact administrator to update your access level.`
+        });
+      }
+
+      if (user.approvedStatus !== 'true' && user.approvedStatus !== true) {
+        return res.status(403).json({
+          status: 'error',
+          message: 'Account not approved. Contact administrator.'
+        });
+      }
+
+    } catch (adminError) {
+      return res.status(500).json({
+        status: 'error',
+        message: 'Error verifying admin access: ' + adminError.message
+      });
+    }
+
+    // Use direct API call to get document and verify ownership
+    const databaseId = process.env.APPWRITE_DATABASE_ID;
+    const collectionId = process.env.CLIMATE_REPORTS_COLLECTION_ID || 'climate_reports';
+    const projectId = process.env.APPWRITE_PROJECT_ID;
+    const apiKey = process.env.APPWRITE_API_KEY;
+    const endpoint = process.env.APPWRITE_ENDPOINT;
+
+    // Get the document first to verify ownership
+    const getUrl = `${endpoint}/databases/${databaseId}/collections/${collectionId}/documents/${reportId}`;
+
+    const getResponse = await fetch(getUrl, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Appwrite-Project': projectId,
+        'X-Appwrite-Key': apiKey
+      }
+    });
+
+    if (!getResponse.ok) {
+      if (getResponse.status === 404) {
+        return res.status(404).json({
+          status: 'error',
+          message: 'Report not found'
+        });
+      }
+      throw new Error(`HTTP ${getResponse.status}: ${getResponse.statusText}`);
+    }
+
+    const existingReport = await getResponse.json();
+
+    if (existingReport.consumerId !== consumerId) {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Access denied to update this report'
+      });
+    }
+
+    // Handle download count increment specifically
+    const finalUpdateData = { ...updateData };
+
+    if (updateData.downloadCount !== undefined) {
+      // If downloadCount is provided as a number to increment by
+      const incrementBy = parseInt(updateData.downloadCount) || 1;
+      const currentCount = parseInt(existingReport.downloadCount) || 0;
+      finalUpdateData.downloadCount = currentCount + incrementBy; // Keep as integer for Appwrite
+    }
+
+    // Ensure we have data to update
+    if (Object.keys(finalUpdateData).length === 0) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'No valid data to update'
+      });
+    }
+
+    // Convert other fields to proper types
+    if (finalUpdateData.fileUrl !== undefined) {
+      finalUpdateData.fileUrl = String(finalUpdateData.fileUrl);
+    }
+    if (finalUpdateData.title !== undefined) {
+      finalUpdateData.title = String(finalUpdateData.title);
+    }
+
+    // Update the document using SDK (more reliable than direct API)
+    const updatedReport = await databases.updateDocument(
+      databaseId,
+      collectionId,
+      reportId,
+      finalUpdateData
+    );
+
+    res.json({
+      status: 'success',
+      message: 'Climate report updated successfully',
+      data: updatedReport
+    });
+
+  } catch (error) {
+    console.error('Update climate report error:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to update climate report',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+// Delete climate report (Admin only)
+app.delete('/api/climate-reports/:reportId', async (req, res) => {
+  try {
+    const { reportId } = req.params;
+    const { consumerId } = req.body;
+
+    if (!reportId || !consumerId) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'reportId and consumerId are required'
+      });
+    }
+
+    // Verify admin access by checking user directly (not using Bearer token)
+    try {
+      const user = await findUserByConsumerID(consumerId);
+
+      if (!user) {
+        return res.status(404).json({
+          status: 'error',
+          message: `User with consumerID '${consumerId}' not found in database. Please ensure you are logged in and your account exists.`
+        });
+      }
+
+      if (user.accessLevel !== 'admin') {
+        return res.status(403).json({
+          status: 'error',
+          message: `Access denied. Current access level: '${user.accessLevel}', required: 'admin'. Contact administrator to update your access level.`
+        });
+      }
+
+      if (user.approvedStatus !== 'true' && user.approvedStatus !== true) {
+        return res.status(403).json({
+          status: 'error',
+          message: 'Account not approved. Contact administrator.'
+        });
+      }
+
+    } catch (adminError) {
+      return res.status(500).json({
+        status: 'error',
+        message: 'Error verifying admin access: ' + adminError.message
+      });
+    }
+
+    // Use direct API call to get document and verify ownership
+    const databaseId = process.env.APPWRITE_DATABASE_ID;
+    const collectionId = process.env.CLIMATE_REPORTS_COLLECTION_ID || 'climate_reports';
+    const projectId = process.env.APPWRITE_PROJECT_ID;
+    const apiKey = process.env.APPWRITE_API_KEY;
+    const endpoint = process.env.APPWRITE_ENDPOINT;
+
+    // Get the document first to verify ownership
+    const getUrl = `${endpoint}/databases/${databaseId}/collections/${collectionId}/documents/${reportId}`;
+
+    const getResponse = await fetch(getUrl, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Appwrite-Project': projectId,
+        'X-Appwrite-Key': apiKey
+      }
+    });
+
+    if (!getResponse.ok) {
+      if (getResponse.status === 404) {
+        return res.status(404).json({
+          status: 'error',
+          message: 'Report not found'
+        });
+      }
+      throw new Error(`HTTP ${getResponse.status}: ${getResponse.statusText}`);
+    }
+
+    const existingReport = await getResponse.json();
+
+    if (existingReport.consumerId !== consumerId) {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Access denied to delete this report'
+      });
+    }
+
+    // Delete the document
+    const deleteUrl = `${endpoint}/databases/${databaseId}/collections/${collectionId}/documents/${reportId}`;
+
+    const deleteResponse = await fetch(deleteUrl, {
+      method: 'DELETE',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Appwrite-Project': projectId,
+        'X-Appwrite-Key': apiKey
+      }
+    });
+
+    if (!deleteResponse.ok) {
+      throw new Error(`HTTP ${deleteResponse.status}: ${deleteResponse.statusText}`);
+    }
+
+    res.json({
+      status: 'success',
+      message: 'Climate report deleted successfully'
+    });
+
+  } catch (error) {
+    console.error('Delete climate report error:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to delete climate report',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+// Get climate report statistics
+app.get('/api/climate-reports/:consumerId/statistics', async (req, res) => {
+  try {
+    const { consumerId } = req.params;
+
+    if (!consumerId) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'consumerId is required'
+      });
+    }
+
+    // Use direct API call to avoid SDK Query issues
+    const databaseId = process.env.APPWRITE_DATABASE_ID;
+    const collectionId = process.env.CLIMATE_REPORTS_COLLECTION_ID || 'climate_reports';
+    const projectId = process.env.APPWRITE_PROJECT_ID;
+    const apiKey = process.env.APPWRITE_API_KEY;
+    const endpoint = process.env.APPWRITE_ENDPOINT;
+
+    const fullUrl = `${endpoint}/databases/${databaseId}/collections/${collectionId}/documents?limit=1000`;
+
+    const apiResponse = await fetch(fullUrl, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Appwrite-Project': projectId,
+        'X-Appwrite-Key': apiKey
+      }
+    });
+
+    if (!apiResponse.ok) {
+      throw new Error(`HTTP ${apiResponse.status}: ${apiResponse.statusText}`);
+    }
+
+    const reports = await apiResponse.json();
+    
+    // Filter by consumerId manually
+    const reportsData = reports.documents ? 
+      reports.documents.filter(doc => doc.consumerId === consumerId) : [];
+    const statistics = {
+      totalReports: reportsData.length,
+      totalDownloads: reportsData.reduce((sum, report) => sum + (parseInt(report.downloadCount) || 0), 0),
+      reportsByType: {},
+      reportsByRegion: {},
+      recentActivity: reportsData.slice(0, 10),
+      totalStorageUsed: reportsData.reduce((total, report) => {
+        const sizeStr = report.fileSize || '0 MB';
+        const sizeValue = parseFloat(sizeStr.replace(' MB', ''));
+        return total + (isNaN(sizeValue) ? 0 : sizeValue);
+      }, 0)
+    };
+
+    // Group by type and region
+    reportsData.forEach(report => {
+      statistics.reportsByType[report.type] = (statistics.reportsByType[report.type] || 0) + 1;
+      statistics.reportsByRegion[report.region] = (statistics.reportsByRegion[report.region] || 0) + 1;
+    });
+
+    res.json({
+      status: 'success',
+      data: statistics
+    });
+
+  } catch (error) {
+    console.error('Get climate report statistics error:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to fetch statistics',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+
+// ===== REPORTS API ROUTES (MongoDB) =====
 
 // Include the reports API routes
 const reportsRoutes = require('./api/reports');
@@ -1836,46 +2414,6 @@ app.use('*', (req, res) => {
     message: 'Endpoint not found'
   });
 });
-
-// Test endpoint for checking email/consumerID uniqueness (development only)
-if (process.env.NODE_ENV === 'development') {
-  app.get('/api/test/check-unique/:type/:value', async (req, res) => {
-    try {
-      const { type, value } = req.params;
-      
-      if (type === 'email') {
-        const exists = await checkEmailExists(value);
-        res.json({
-          status: 'success',
-          type: 'email',
-          value: value,
-          exists: exists,
-          message: exists ? 'Email already exists' : 'Email is unique'
-        });
-      } else if (type === 'consumerid') {
-        const exists = await checkConsumerIdExists(value);
-        res.json({
-          status: 'success',
-          type: 'consumerID',
-          value: value,
-          exists: exists,
-          message: exists ? 'ConsumerID already exists' : 'ConsumerID is unique'
-        });
-      } else {
-        res.status(400).json({
-          status: 'error',
-          message: 'Invalid type. Use "email" or "consumerid"'
-        });
-      }
-    } catch (error) {
-      res.status(500).json({
-        status: 'error',
-        message: 'Failed to check uniqueness',
-        error: error.message
-      });
-    }
-  });
-}
 
 // Global error handler
 app.use((error, req, res, next) => {
