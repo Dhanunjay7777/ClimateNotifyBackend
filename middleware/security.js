@@ -75,15 +75,21 @@ function containsSQLInjection(input) {
 }
 
 function preventSQLInjection(req, res, next) {
-  const checkObject = (obj) => {
+  const fieldsToSkip = ['fileData', 'file', 'image', 'data', 'base64', 'buffer', 'content'];
+  
+  const checkObject = (obj, parentKey = '') => {
     for (const key in obj) {
       if (obj.hasOwnProperty(key)) {
+        if (fieldsToSkip.includes(key) || fieldsToSkip.includes(parentKey)) {
+          continue;
+        }
+        
         const value = obj[key];
         if (typeof value === 'string' && containsSQLInjection(value)) {
           return true;
         }
         if (typeof value === 'object' && value !== null) {
-          if (checkObject(value)) return true;
+          if (checkObject(value, key)) return true;
         }
       }
     }
