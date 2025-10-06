@@ -22,7 +22,8 @@ async function uploadFileToAppwriteStorage(fileBuffer, filename) {
     const fileUrl = `${process.env.APPWRITE_ENDPOINT}/storage/buckets/${bucketId}/files/${fileId}/view?project=${process.env.APPWRITE_PROJECT_ID}`;
     return { fileId, fileUrl };
   } catch (error) {
-    console.error('❌ Appwrite upload error:', error);
+    // Log error message only, not full object
+    console.error('❌ Appwrite upload error:', error.message || 'Upload failed');
     throw error;
   }
 }
@@ -39,6 +40,32 @@ const bcrypt = require('bcrypt');
 const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
 require('dotenv').config();
+
+// Import security middleware
+const {
+  sanitizeBody,
+  sanitizeQuery,
+  preventSQLInjection,
+  logSuspiciousActivity,
+  validateContentType,
+  isValidEmail,
+  isValidPassword,
+  sanitizeErrorMessage,
+  validatePasswordStrength,
+  validateRequestSize,
+  addSecurityHeaders,
+  preventNoSQLInjection,
+  validateEnvironment,
+  validateFileUpload
+} = require('./middleware/security');
+
+// Validate environment variables at startup
+try {
+  validateEnvironment();
+} catch (error) {
+  console.error('Server startup failed:', error.message);
+  process.exit(1);
+}
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -320,12 +347,17 @@ async function makeRenderAPIRequest(method, endpoint, data = null) {
     const response = await axios(config);
     return response.data;
   } catch (error) {
-    console.error('Render API Error:', {
-      status: error.response?.status,
-      message: error.response?.data?.message || error.message,
-      endpoint: endpoint
-    });
-    throw new Error(`Render API Error: ${error.response?.data?.message || error.message}`);
+    // Log error details server-side only
+    if (process.env.NODE_ENV === 'development') {
+      console.error('Render API Error:', {
+        status: error.response?.status,
+        message: error.response?.data?.message || error.message,
+        endpoint: endpoint
+      });
+    } else {
+      console.error('Render API Error:', error.response?.status || 'Request failed');
+    }
+    throw new Error('Render API request failed');
   }
 }
 
@@ -432,49 +464,191 @@ async function generateUniqueConsumerID() {
 }
 
 // Middleware
-app.use(helmet());
+
+// Enhanced Helmet Security Configuration
+app.use(helmet({
+  // Content Security Policy - controls which resources can be loaded
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"], // Allow inline styles for React
+      scriptSrc: ["'self'", "'unsafe-inline'"], // Allow inline scripts for React
+      imgSrc: ["'self'", "data:", "https:", "blob:"], // Allow images from various sources
+      connectSrc: [
+        "'self'",
+        process.env.APPWRITE_ENDPOINT || "https://cloud.appwrite.io",
+        "https://api.render.com",
+        "https://fcm.googleapis.com",
+        process.env.CLIENT_URL || "http://localhost:5173"
+      ],
+      fontSrc: ["'self'", "data:"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'", "blob:"],
+      frameSrc: ["'none'"],
+      upgradeInsecureRequests: process.env.NODE_ENV === 'production' ? [] : null
+    }
+  },
+  
+  // Cross-Origin-Embedder-Policy - controls what resources can be embedded
+  crossOriginEmbedderPolicy: false, // Disabled to allow external resources
+  
+  // Cross-Origin-Opener-Policy - isolates browsing context
+  crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
+  
+  // Cross-Origin-Resource-Policy - controls who can load resources
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  
+  dnsPrefetchControl: { allow: true },
+  
+  expectCt: {
+    enforce: true,
+    maxAge: 30
+  },
+  
+  frameguard: { action: 'deny' },
+  
+  hidePoweredBy: true,
+  
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  },
+  
+  ieNoOpen: true,
+  
+  noSniff: true,
+  
+  originAgentCluster: true,
+  
+  permittedCrossDomainPolicies: { permittedPolicies: "none" },
+  
+  referrerPolicy: { policy: "strict-origin-when-cross-origin" },
+  
+  xssFilter: true
+}));
+
 app.use(compression());
+
 app.use(cors({
   origin: process.env.CLIENT_URL || 'http://localhost:5173',
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  exposedHeaders: ['Content-Range', 'X-Content-Range'],
+  maxAge: 86400
 }));
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
 
-// Rate limiting
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
 const limiter = rateLimit({
   windowMs: (process.env.RATE_LIMIT_WINDOW || 15) * 60 * 1000,
   max: process.env.RATE_LIMIT_MAX_REQUESTS || 100,
   message: {
     status: 'error',
     message: 'Too many requests from this IP, please try again later.'
-  }
+  },
+  standardHeaders: true,
+  legacyHeaders: false
 });
 app.use('/api/', limiter);
 
-// Health check endpoint
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  skipSuccessfulRequests: false,
+  message: {
+    status: 'error',
+    message: 'Too many authentication attempts. Please try again after 15 minutes.'
+  }
+});
+
+const fileUploadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  skipSuccessfulRequests: false,
+  message: {
+    status: 'error',
+    message: 'Too many file uploads. Please try again after 1 hour.'
+  }
+});
+
+app.use('/api/login', authLimiter);
+app.use('/api/signup', authLimiter);
+
+app.use(addSecurityHeaders);
+app.use(validateRequestSize);
+app.use(logSuspiciousActivity);
+app.use(sanitizeQuery);
+app.use(sanitizeBody);
+app.use(preventSQLInjection);
+app.use(preventNoSQLInjection);
+app.use(validateContentType);
+
+
 app.get('/health', async (req, res) => {
+  const health = {
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    services: {}
+  };
+
+  try {
+    await databases.list();
+    health.services.appwrite = 'healthy';
+  } catch (error) {
+    health.services.appwrite = 'unhealthy';
+    health.status = 'degraded';
+    if (process.env.NODE_ENV === 'development') {
+      console.error('Health check - Appwrite error:', error.message);
+    }
+  }
+
+  try {
+    if (firebaseApp) {
+      await admin.messaging().send({
+        topic: 'health-check-topic',
+        notification: { title: 'test', body: 'test' }
+      }, true);
+      health.services.firebase = 'healthy';
+    } else {
+      health.services.firebase = 'not_configured';
+    }
+  } catch (error) {
+    if (error.code === 'messaging/invalid-argument' || error.code === 'messaging/registration-token-not-registered') {
+      health.services.firebase = 'healthy';
+    } else {
+      health.services.firebase = 'unhealthy';
+      health.status = 'degraded';
+      if (process.env.NODE_ENV === 'development') {
+        console.error('Health check - Firebase error:', error.message);
+      }
+    }
+  }
+
+  if (health.status === 'degraded') {
+    return res.status(503).json(health);
+  }
+
+  res.json(health);
+});
+
+// Legacy health check (kept for backward compatibility)
+app.get('/health-simple', async (req, res) => {
   try {
     await databases.list();
     res.json({
       status: 'success',
-      message: 'Server is running and connected to Appwrite',
-      timestamp: new Date().toISOString(),
-      environment: process.env.NODE_ENV || 'development',
-      appwrite: {
-        endpoint: process.env.APPWRITE_ENDPOINT,
-        project: process.env.APPWRITE_PROJECT_ID,
-        database: process.env.APPWRITE_DATABASE_ID
-      }
+      message: 'Server is running',
     });
   } catch (error) {
-
+    if (process.env.NODE_ENV === 'development') {
+      console.error('Health check - Appwrite connection error:', error.message);
+    }
     res.status(500).json({ 
       status: 'error', 
-      message: 'Server is running but Appwrite connection failed', 
-      error: error.message 
+      message: 'Service temporarily unavailable'
     });
   }
 });
@@ -485,10 +659,6 @@ app.get('/health', async (req, res) => {
 app.post('/api/signup', async (req, res) => {
   try {
     const { fullname, email, password, agreeTerms } = req.body;
-
-
-
-
 
     // Validation
     if (!fullname || !email || !password || agreeTerms === undefined) {
@@ -505,15 +675,25 @@ app.post('/api/signup', async (req, res) => {
       });
     }
 
-    // Email validation
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
+    // Enhanced email validation using security middleware
+    if (!isValidEmail(email)) {
       return res.status(400).json({
         status: 'error',
         message: 'Please provide a valid email address'
       });
     }
 
+    // Enhanced password validation with strength requirements
+    const passwordValidation = validatePasswordStrength(password);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Password does not meet security requirements',
+        errors: passwordValidation.errors
+      });
+    }
+
+    // Legacy check for backwards compatibility (minimum 6 characters)
     if (password.length < 6) {
       return res.status(400).json({
         status: 'error',
@@ -1494,10 +1674,10 @@ app.get('/api/admin/render/services', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Get services error:', error);
-    res.status(error.message.includes('Authentication') ? 401 : 500).json({
+    console.error('Get services error:', error.message || 'Request failed');
+    res.status(error.message?.includes('Authentication') ? 401 : 500).json({
       status: 'error',
-      message: error.message || 'Failed to retrieve services'
+      message: process.env.NODE_ENV === 'production' ? 'Failed to retrieve services' : error.message
     });
   }
 });
@@ -1518,7 +1698,7 @@ app.get('/api/admin/render/services/:serviceId', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Get service error:', error);
+    console.error('Get service error:', error.message || 'Operation failed');
     res.status(error.message.includes('Authentication') ? 401 : 500).json({
       status: 'error',
       message: error.message || 'Failed to retrieve service details'
@@ -1542,7 +1722,7 @@ app.post('/api/admin/render/services/:serviceId/deploy', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Deploy service error:', error);
+    console.error('Deploy service error:', error.message || 'Operation failed');
     res.status(error.message.includes('Authentication') ? 401 : 500).json({
       status: 'error',
       message: error.message || 'Failed to deploy service'
@@ -1566,7 +1746,7 @@ app.post('/api/admin/render/services/:serviceId/suspend', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Suspend service error:', error);
+    console.error('Suspend service error:', error.message || 'Operation failed');
     res.status(error.message.includes('Authentication') ? 401 : 500).json({
       status: 'error',
       message: error.message || 'Failed to suspend service'
@@ -1590,7 +1770,7 @@ app.post('/api/admin/render/services/:serviceId/resume', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Resume service error:', error);
+    console.error('Resume service error:', error.message || 'Operation failed');
     res.status(error.message.includes('Authentication') ? 401 : 500).json({
       status: 'error',
       message: error.message || 'Failed to resume service'
@@ -1614,7 +1794,7 @@ app.post('/api/admin/render/services/:serviceId/restart', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Restart service error:', error);
+    console.error('Restart service error:', error.message || 'Operation failed');
     res.status(error.message.includes('Authentication') ? 401 : 500).json({
       status: 'error',
       message: error.message || 'Failed to restart service'
@@ -1639,7 +1819,7 @@ app.get('/api/admin/render/services/:serviceId/deployments', async (req, res) =>
     });
 
   } catch (error) {
-    console.error('Get deployments error:', error);
+    console.error('Get deployments error:', error.message || 'Operation failed');
     res.status(error.message.includes('Authentication') ? 401 : 500).json({
       status: 'error',
       message: error.message || 'Failed to retrieve service deployments'
@@ -1650,7 +1830,7 @@ app.get('/api/admin/render/services/:serviceId/deployments', async (req, res) =>
 // ===== CLIMATE REPORTS API ENDPOINTS =====
 
 // Save climate report to database (Admin only)
-app.post('/api/climate-reports', async (req, res) => {
+app.post('/api/climate-reports', fileUploadLimiter, validateFileUpload, async (req, res) => {
   try {
     const { reportData, consumerId, fileData } = req.body;
 
@@ -1719,7 +1899,7 @@ app.post('/api/climate-reports', async (req, res) => {
         fileSize = `${sizeInMB} MB`;
 
       } catch (uploadError) {
-        console.error('❌ File upload failed:', uploadError);
+        console.error('❌ File upload failed:', uploadError.message || 'Upload failed');
         return res.status(500).json({
           status: 'error',
           message: 'Failed to upload file to storage',
@@ -1833,8 +2013,11 @@ app.get('/api/user/:consumerID', async (req, res) => {
     });
     
   } catch (error) {
-    console.error('❌ Error looking up user:', error);
-    res.status(500).json({ error: error.message });
+    console.error('❌ Error looking up user:', error.message || 'Lookup failed');
+    res.status(500).json({ 
+      status: 'error',
+      message: 'Failed to retrieve user information'
+    });
   }
 });
 
@@ -1893,7 +2076,7 @@ app.get('/api/climate-reports', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Get climate reports error:', error);
+    console.error('Get climate reports error:', error.message || 'Operation failed');
     res.status(500).json({
       status: 'error',
       message: 'Failed to fetch climate reports',
@@ -1952,7 +2135,7 @@ app.get('/api/climate-reports/consumer/:consumerId', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Get climate reports error:', error);
+    console.error('Get climate reports error:', error.message || 'Operation failed');
     res.status(500).json({
       status: 'error',
       message: 'Failed to fetch climate reports',
@@ -2085,7 +2268,7 @@ app.put('/api/climate-reports/:reportId', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Update climate report error:', error);
+    console.error('Update climate report error:', error.message || 'Operation failed');
     res.status(500).json({
       status: 'error',
       message: 'Failed to update climate report',
@@ -2199,7 +2382,7 @@ app.delete('/api/climate-reports/:reportId', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Delete climate report error:', error);
+    console.error('Delete climate report error:', error.message || 'Operation failed');
     res.status(500).json({
       status: 'error',
       message: 'Failed to delete climate report',
@@ -2272,7 +2455,7 @@ app.get('/api/climate-reports/:consumerId/statistics', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Get climate report statistics error:', error);
+    console.error('Get climate report statistics error:', error.message || 'Operation failed');
     res.status(500).json({
       status: 'error',
       message: 'Failed to fetch statistics',
@@ -2415,14 +2598,25 @@ app.use('*', (req, res) => {
   });
 });
 
-// Global error handler
+// Global error handler with sanitized error messages
 app.use((error, req, res, next) => {
-
+  // Log error for debugging (server-side only)
+  console.error('Error:', {
+    message: error.message,
+    path: req.path,
+    method: req.method,
+    ip: req.ip,
+    timestamp: new Date().toISOString()
+  });
   
+  // Send sanitized error to client
   res.status(error.status || 500).json({
     status: 'error',
-    message: error.message || 'Internal server error',
-    ...(process.env.NODE_ENV === 'development' && { stack: error.stack })
+    message: sanitizeErrorMessage(error),
+    ...(process.env.NODE_ENV === 'development' && { 
+      details: error.message,
+      stack: error.stack 
+    })
   });
 });
 
