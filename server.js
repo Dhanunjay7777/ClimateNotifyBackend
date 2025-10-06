@@ -70,6 +70,10 @@ try {
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Trust proxy - Required for apps behind reverse proxies (Render, Heroku, etc.)
+// This allows Express to correctly identify client IPs from X-Forwarded-For headers
+app.set('trust proxy', 1);
+
 // Initialize Appwrite
 const client = new Client()
   .setEndpoint(process.env.APPWRITE_ENDPOINT)
