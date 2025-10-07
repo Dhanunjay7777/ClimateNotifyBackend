@@ -476,4 +476,87 @@ router.get('/health', async (req, res) => {
   }
 });
 
+// ===== CONSUMERS ENDPOINTS (MongoDB Climate.Consumers collection) =====
+
+// Get all consumers with contact information (name, email, phone)
+router.get('/consumers/contacts', async (req, res) => {
+  try {
+    const database = await initDB();
+    const collection = database.collection('Consumers');
+    
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 100;
+    const skip = (page - 1) * limit;
+    
+    // Build filter
+    const filter = {};
+    
+    // Search filter
+    if (req.query.search && req.query.search.trim()) {
+      filter.$or = [
+        { name: { $regex: req.query.search, $options: 'i' } },
+        { email: { $regex: req.query.search, $options: 'i' } },
+        { phone: { $regex: req.query.search, $options: 'i' } }
+      ];
+    }
+    
+    // Get consumers with ONLY name, email, phone
+    const consumers = await collection
+      .find(filter, {
+        projection: {
+          _id: 1,
+          name: 1,
+          email: 1,
+          phone: 1
+        }
+      })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+
+    // Transform consumers - only return those with contact info
+    const contactList = consumers
+      .filter(consumer => consumer.email || consumer.phone)
+      .map(consumer => ({
+        id: consumer._id,
+        name: consumer.name || 'Unknown',
+        email: consumer.email || null,
+        phone: consumer.phone || null
+      }));
+    
+    const totalConsumers = await collection.countDocuments(filter);
+    const withPhone = contactList.filter(c => c.phone).length;
+    const withEmail = contactList.filter(c => c.email).length;
+    const withBoth = contactList.filter(c => c.phone && c.email).length;
+    
+    res.json({
+      status: 'success',
+      data: {
+        contacts: contactList,
+        pagination: {
+          currentPage: page,
+          totalPages: Math.ceil(totalConsumers / limit),
+          totalConsumers: totalConsumers,
+          hasNext: page < Math.ceil(totalConsumers / limit),
+          hasPrev: page > 1
+        },
+        statistics: {
+          total: contactList.length,
+          withPhone: withPhone,
+          withEmail: withEmail,
+          withBoth: withBoth
+        }
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error fetching consumer contacts:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to fetch consumer contacts',
+      error: error.message
+    });
+  }
+});
+
 module.exports = router;
