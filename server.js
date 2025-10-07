@@ -560,7 +560,7 @@ app.use('/api/', limiter);
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 5,
+  max: 20,
   skipSuccessfulRequests: false,
   message: {
     status: 'error',
@@ -2471,9 +2471,164 @@ app.get('/api/climate-reports/:consumerId/statistics', async (req, res) => {
 
 // ===== REPORTS API ROUTES (MongoDB) =====
 
-// Include the reports API routes
+// Include the reports API routes (also includes consumers endpoints)
 const reportsRoutes = require('./api/reports');
 app.use('/api/reports', reportsRoutes);
+
+// ===== SMS NOTIFICATIONS ENDPOINTS (Appwrite) =====
+
+// Save SMS notification to Appwrite and send via Textbelt
+app.post('/api/sms-notifications', async (req, res) => {
+  try {
+    const { message, phoneNumbers, sentStatus, sentTime } = req.body;
+
+    if (!message || !phoneNumbers || !Array.isArray(phoneNumbers) || phoneNumbers.length === 0) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Message and phoneNumbers array are required',
+        received: { message, phoneNumbers }
+      });
+    }
+
+    // Check if collection ID is configured
+    const collectionId = process.env.SMS_NOTIFICATIONS_COLLECTION_ID;
+    if (!collectionId) {
+      return res.status(500).json({
+        status: 'error',
+        message: 'SMS_NOTIFICATIONS_COLLECTION_ID not configured in environment variables'
+      });
+    }
+
+    const savedNotifications = [];
+    const errors = [];
+    
+    // Save each phone number as a separate document
+    for (const phoneNumber of phoneNumbers) {
+      let actualSentStatus = 'failed';
+      let errorMessage = null;
+
+      // Save to Appwrite database
+      try {
+        const notification = await databases.createDocument(
+          process.env.APPWRITE_DATABASE_ID,
+          collectionId,
+          ID.unique(),
+          {
+            message: String(message),
+            phoneNumber: String(phoneNumber),
+            sentStatus: 'sent', // Status is 'sent' if successfully stored in Appwrite
+            sentTime: String(sentTime || new Date().toISOString())
+          }
+        );
+        
+        savedNotifications.push(notification);
+        actualSentStatus = 'sent';
+      } catch (dbError) {
+        actualSentStatus = 'failed';
+        errorMessage = dbError.message || 'Failed to store SMS notification';
+        errors.push({
+          phoneNumber: phoneNumber,
+          error: errorMessage,
+          code: dbError.code,
+          type: 'database_error'
+        });
+      }
+    }
+
+    if (savedNotifications.length === 0) {
+      return res.status(500).json({
+        status: 'error',
+        message: 'Failed to save any SMS notifications',
+        errors: errors
+      });
+    }
+
+    res.status(201).json({
+      status: 'success',
+      message: `SMS notifications saved for ${savedNotifications.length} recipient(s)`,
+      data: {
+        total: phoneNumbers.length,
+        saved: savedNotifications.length,
+        failed: phoneNumbers.length - savedNotifications.length,
+        errors: errors.length > 0 ? errors : undefined
+      }
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to save SMS notifications',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error',
+      details: process.env.NODE_ENV === 'development' ? {
+        type: error.type,
+        code: error.code
+      } : undefined
+    });
+  }
+});
+
+// Get SMS notifications history
+app.get('/api/sms-notifications', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20;
+
+    // Check if collection ID is configured
+    const collectionId = process.env.SMS_NOTIFICATIONS_COLLECTION_ID;
+    if (!collectionId) {
+      return res.json({
+        status: 'success',
+        data: [],
+        total: 0,
+        message: 'SMS_NOTIFICATIONS_COLLECTION_ID not configured'
+      });
+    }
+
+    const url = `${process.env.APPWRITE_ENDPOINT}/databases/${process.env.APPWRITE_DATABASE_ID}/collections/${collectionId}/documents`;
+    
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'X-Appwrite-Project': process.env.APPWRITE_PROJECT_ID,
+        'X-Appwrite-Key': process.env.APPWRITE_API_KEY,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+
+    const notifications = data.documents.map(doc => ({
+      id: doc.$id,
+      message: doc.message,
+      phoneNumber: doc.phoneNumber,
+      sentStatus: doc.sentStatus,
+      sentTime: doc.sentTime,
+      createdAt: doc.$createdAt
+    }));
+
+    // Sort by newest first
+    notifications.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    // Limit results
+    const limitedNotifications = notifications.slice(0, limit);
+
+    res.json({
+      status: 'success',
+      data: limitedNotifications,
+      total: data.total
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to retrieve SMS notifications',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
 
 // ===== NOTIFICATION ENDPOINTS =====
 
@@ -2550,15 +2705,7 @@ app.post('/api/notifications/broadcast', async (req, res) => {
     if (tokens.length === 0) {
       return res.json({
         status: 'success',
-        message: 'No active devices to send notifications to',
-        data: {
-          totalTargets: 0,
-          successCount: 0,
-          failureCount: 0,
-          title: title,
-          body: body,
-          timestamp: new Date().toISOString()
-        }
+        message: 'No active devices to send notifications to'
       });
     }
 
@@ -2569,16 +2716,7 @@ app.post('/api/notifications/broadcast', async (req, res) => {
     
     res.json({
       status: 'success',
-      message: `Notification broadcast completed`,
-      data: {
-        totalTargets: tokens.length,
-        successCount: result.success,
-        failureCount: result.failure,
-        title: title,
-        body: body,
-        timestamp: new Date().toISOString(),
-        errors: result.errors.length > 0 ? result.errors : undefined
-      }
+      message: `Notification broadcast completed`
     });
 
 
