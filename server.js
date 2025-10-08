@@ -2501,13 +2501,43 @@ app.post('/api/sms-notifications', async (req, res) => {
 
     const savedNotifications = [];
     const errors = [];
+    const textbeeApiKey = process.env.TEXTBEE_API_KEY;
+    const textbeeDeviceId = process.env.TEXTBEE_DEVICE_ID;
     
-    // Save each phone number as a separate document
+    // Send SMS and save each phone number as a separate document
     for (const phoneNumber of phoneNumbers) {
       let actualSentStatus = 'failed';
       let errorMessage = null;
 
-      // Save to Appwrite database
+      // Send SMS via Textbee API
+      try {
+        const textbeeResponse = await fetch(`https://api.textbee.dev/api/v1/gateway/devices/${textbeeDeviceId}/send-sms`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': textbeeApiKey
+          },
+          body: JSON.stringify({
+            recipients: [phoneNumber.trim()],
+            message: message
+          })
+        });
+
+        const textbeeResult = await textbeeResponse.json();
+        
+        // Check for success in the nested data object
+        if (textbeeResponse.ok && textbeeResult.data?.success) {
+          actualSentStatus = 'sent';
+        } else {
+          actualSentStatus = 'failed';
+          errorMessage = textbeeResult.data?.message || textbeeResult.message || textbeeResult.error || 'SMS delivery failed';
+        }
+      } catch (smsError) {
+        actualSentStatus = 'failed';
+        errorMessage = smsError.message || 'Failed to send SMS';
+      }
+
+      // Save to Appwrite database with the actual SMS delivery status
       try {
         const notification = await databases.createDocument(
           process.env.APPWRITE_DATABASE_ID,
@@ -2516,21 +2546,27 @@ app.post('/api/sms-notifications', async (req, res) => {
           {
             message: String(message),
             phoneNumber: String(phoneNumber),
-            sentStatus: 'sent', // Status is 'sent' if successfully stored in Appwrite
+            sentStatus: String(actualSentStatus),
             sentTime: String(sentTime || new Date().toISOString())
           }
         );
         
         savedNotifications.push(notification);
-        actualSentStatus = 'sent';
       } catch (dbError) {
-        actualSentStatus = 'failed';
         errorMessage = dbError.message || 'Failed to store SMS notification';
         errors.push({
           phoneNumber: phoneNumber,
           error: errorMessage,
           code: dbError.code,
           type: 'database_error'
+        });
+      }
+
+      if (actualSentStatus === 'failed' && errorMessage) {
+        errors.push({
+          phoneNumber: phoneNumber,
+          error: errorMessage,
+          type: 'sms_delivery_error'
         });
       }
     }
